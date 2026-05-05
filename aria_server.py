@@ -1,19 +1,5 @@
 """
-aria_server.py
-──────────────
-ARIA web server — runs on your home PC, accessible from iPhone via ngrok.
-
-SETUP:
-  pip install flask anthropic colorama
-
-USAGE:
-  1. Run this script:     python aria_server.py
-  2. Run ngrok:           ngrok http 5000
-  3. Copy the ngrok URL (e.g. https://abc123.ngrok.io)
-  4. Open that URL on your iPhone in Safari
-  5. Talk to ARIA from anywhere!
-
-ARIA remembers everything across all devices.
+aria_server.py - Fixed for Railway deployment
 """
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -31,13 +17,12 @@ except ImportError:
 app = Flask(__name__, static_folder="aria_web")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-MEMORY_FILE  = "ai_memory.json"
-PROFILE_FILE = "ai_profile.json"
+MEMORY_FILE  = "/tmp/ai_memory.json"    # Railway uses /tmp for writable storage
+PROFILE_FILE = "/tmp/ai_profile.json"
 AI_NAME      = "ARIA"
-MAX_MEMORY   = 100
 MODEL        = "claude-sonnet-4-20250514"
 
-# ── MEMORY SYSTEM ─────────────────────────────────────────────────────────────
+# ── MEMORY ────────────────────────────────────────────────────────────────────
 def load_memory():
     if Path(MEMORY_FILE).exists():
         with open(MEMORY_FILE, "r") as f:
@@ -56,7 +41,7 @@ def load_profile():
         "name": None,
         "interests": [],
         "facts": [],
-        "games_played": [],
+        "games_played": ["snake", "flappy bird", "pacman"],
         "printer": "Ender 3 S1 Pro",
         "conversations": 0,
         "first_met": str(datetime.date.today())
@@ -74,19 +59,16 @@ def format_memory(memory, profile):
         lines.append(f"Interests: {', '.join(profile['interests'])}")
     if profile["facts"]:
         lines.append(f"Known facts: {'; '.join(profile['facts'][-10:])}")
-    if profile["printer"]:
-        lines.append(f"3D Printer: {profile['printer']}")
-    if profile["games_played"]:
-        lines.append(f"Games worked on: {', '.join(profile['games_played'])}")
+    lines.append(f"3D Printer: {profile.get('printer', 'Ender 3 S1 Pro')}")
+    lines.append(f"Games worked on: {', '.join(profile.get('games_played', []))}")
     lines.append(f"Conversations: {profile['conversations']}")
     lines.append(f"First met: {profile['first_met']}")
-    lines.append(f"Also knows: User is building self-learning game AIs (Snake, Flappy Bird, Pacman) using DQN reinforcement learning on a PC with RTX 2060 GPU and 36GB RAM.")
-
+    lines.append("Also knows: User is building self-learning game AIs using DQN reinforcement learning on a PC with RTX 2060 GPU and 36GB RAM.")
     if memory:
         lines.append("\nRecent exchanges:")
         for m in memory[-8:]:
             lines.append(f"[{m['date']}] User: {m['user']}")
-            lines.append(f"[{m['date']}] {AI_NAME}: {m['assistant'][:150]}...")
+            lines.append(f"[{m['date']}] ARIA: {m['assistant'][:150]}...")
     return "\n".join(lines)
 
 def extract_facts(user_msg, profile):
@@ -96,7 +78,7 @@ def extract_facts(user_msg, profile):
         for i, w in enumerate(words):
             if w.lower() in ["is", "me"] and i + 1 < len(words):
                 name = words[i+1].strip(".,!?")
-                if name[0].isupper() and len(name) > 1:
+                if len(name) > 1 and name[0].isupper():
                     profile["name"] = name
                     break
     for kw in ["i love", "i like", "i enjoy", "i play", "i'm into"]:
@@ -109,18 +91,11 @@ def extract_facts(user_msg, profile):
     for game in games:
         if game in msg_lower and game not in profile["games_played"]:
             profile["games_played"].append(game)
-    for trigger in ["i work", "i live", "i have", "i am"]:
-        if trigger in msg_lower:
-            idx = msg_lower.find(trigger)
-            fact = user_msg[idx:idx+60].strip(".,!? ")
-            if fact and len(fact) > 10 and fact not in profile["facts"]:
-                profile["facts"].append(fact)
     return profile
 
-# In-memory conversation history per session
 session_history = []
 
-# ── API ROUTES ────────────────────────────────────────────────────────────────
+# ── ROUTES ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory("aria_web", "index.html")
@@ -128,9 +103,8 @@ def index():
 @app.route("/chat", methods=["POST"])
 def chat():
     global session_history
-
-    data       = request.json
-    user_msg   = data.get("message", "").strip()
+    data     = request.json
+    user_msg = data.get("message", "").strip()
     if not user_msg:
         return jsonify({"error": "empty message"}), 400
 
@@ -138,9 +112,7 @@ def chat():
     profile = load_profile()
     profile["conversations"] += 1
 
-    memory_context = format_memory(memory, profile)
-
-    system_prompt = f"""You are {AI_NAME}, a personal AI with permanent long-term memory.
+    system_prompt = f"""You are ARIA, a personal AI with permanent long-term memory.
 You remember everything about this person and build a genuine relationship over time.
 
 PERSONALITY:
@@ -148,13 +120,12 @@ PERSONALITY:
 - Reference past conversations naturally
 - Get more personal and familiar over time
 - Encouraging and supportive of their projects
-- Keep responses conversational and natural — not too long
+- Keep responses conversational — not too long
 
 WHAT YOU KNOW:
-{memory_context}
+{format_memory(memory, profile)}
 
-Never forget anything they've told you. Grow more comfortable over time.
-If this is a first conversation, introduce yourself warmly and ask their name.
+Never forget anything they've told you. If this is a first conversation, introduce yourself warmly and ask their name.
 """
 
     messages = []
@@ -164,7 +135,7 @@ If this is a first conversation, introduce yourself warmly and ask their name.
     messages.append({"role": "user", "content": user_msg})
 
     try:
-        client   = anthropic.Anthropic()
+        client   = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
         response = client.messages.create(
             model=MODEL,
             max_tokens=500,
@@ -175,7 +146,6 @@ If this is a first conversation, introduce yourself warmly and ask their name.
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Save to memory
     exchange = {
         "user":      user_msg,
         "assistant": reply,
@@ -183,8 +153,8 @@ If this is a first conversation, introduce yourself warmly and ask their name.
     }
     session_history.append(exchange)
     memory.append(exchange)
-    if len(memory) > MAX_MEMORY * 10:
-        memory = memory[-(MAX_MEMORY * 10):]
+    if len(memory) > 500:
+        memory = memory[-500:]
 
     profile = extract_facts(user_msg, profile)
     save_memory(memory)
@@ -198,25 +168,10 @@ def get_memory():
     profile = load_profile()
     return jsonify({"memory": memory[-20:], "profile": profile})
 
-@app.route("/reset_session", methods=["POST"])
-def reset_session():
-    global session_history
-    session_history = []
-    return jsonify({"status": "session reset"})
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "agent": "ARIA"})
 
 if __name__ == "__main__":
-    # Create web folder
-    os.makedirs("aria_web", exist_ok=True)
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("\n[Setup] Set your API key first:")
-        print('  $env:ANTHROPIC_API_KEY="your-key-here"')
-        print("  Then run: python aria_server.py\n")
-    else:
-        print(f"\n{'='*50}")
-        print(f"  ARIA Server Starting...")
-        print(f"  Local:  http://localhost:5000")
-        print(f"  For iPhone access, run ngrok in another window:")
-        print(f"    ngrok http 5000")
-        print(f"{'='*50}\n")
-        app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
