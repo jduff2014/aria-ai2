@@ -97,40 +97,85 @@ textarea::placeholder{color:var(--dim)}
   </div>
 </div>
 <div class="inp">
-  <div class="iw"><textarea id="inp" placeholder="Talk to ARIA..." rows="1" onkeydown="hk(event)" oninput="ar(this)"></textarea></div>
-  <button class="sb" id="sb" onclick="send()"><svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+  <div class="iw"><textarea id="inputBox" placeholder="Talk to ARIA..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea></div>
+  <button class="sb" id="sendButton" onclick="sendMessage()"><svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
 </div>
 <script>
-const msgs=document.getElementById('msgs'),inp=document.getElementById('inp'),sb=document.getElementById('sb');
-let busy=false;
-function ar(e){e.style.height='auto';e.style.height=Math.min(e.scrollHeight,100)+'px'}
-function hk(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}
-function tn(){return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
-function addMsg(role,text){
-  const w=msgs.querySelector('.welcome');if(w)w.remove();
-  const d=document.createElement('div');d.className='msg '+role;
-  const av=role==='ai'?'🧠':'👤',name=role==='ai'?'ARIA':'YOU';
-  d.innerHTML=`<div class="mav">${av}</div><div class="mc"><div class="mn">${name}</div><div class="mb">${text.replace(/\n/g,'<br>')}</div><div class="mt">${tn()}</div></div>`;
-  msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;
+var msgsEl = document.getElementById('msgs');
+var inputEl = document.getElementById('inputBox');
+var sendBtn = document.getElementById('sendButton');
+var isBusy = false;
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 100) + 'px';
 }
-function showTyping(){
-  const d=document.createElement('div');d.className='msg ai';d.id='typing';
-  d.innerHTML='<div class="mav">🧠</div><div class="mc"><div class="mn">ARIA</div><div class="mb typing"><div class="td"></div><div class="td"></div><div class="td"></div></div></div>';
-  msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
 }
-function hideTyping(){const t=document.getElementById('typing');if(t)t.remove()}
-async function send(){
-  const text=inp.value.trim();if(!text||busy)return;
-  inp.value='';inp.style.height='auto';busy=true;sb.disabled=true;
-  addMsg('user',text);showTyping();
-  try{
-    const r=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
-    const d=await r.json();hideTyping();
-    addMsg('ai',d.reply||'Error: '+(d.error||'unknown'));
-  }catch(e){hideTyping();addMsg('ai','Could not reach ARIA. Try again!');}
-  busy=false;sb.disabled=false;inp.focus();
+
+function getTime() {
+  return new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
 }
-inp.focus();
+
+function addMessage(role, text) {
+  var welcome = msgsEl.querySelector('.welcome');
+  if (welcome) welcome.remove();
+  var div = document.createElement('div');
+  div.className = 'msg ' + role;
+  var avatar = role === 'ai' ? '🧠' : '👤';
+  var name = role === 'ai' ? 'ARIA' : 'YOU';
+  div.innerHTML = '<div class="mav">' + avatar + '</div><div class="mc"><div class="mn">' + name + '</div><div class="mb">' + text.replace(/\n/g, '<br>') + '</div><div class="mt">' + getTime() + '</div></div>';
+  msgsEl.appendChild(div);
+  msgsEl.scrollTop = msgsEl.scrollHeight;
+}
+
+function showTyping() {
+  var div = document.createElement('div');
+  div.className = 'msg ai';
+  div.id = 'typingIndicator';
+  div.innerHTML = '<div class="mav">🧠</div><div class="mc"><div class="mn">ARIA</div><div class="mb typing"><div class="td"></div><div class="td"></div><div class="td"></div></div></div>';
+  msgsEl.appendChild(div);
+  msgsEl.scrollTop = msgsEl.scrollHeight;
+}
+
+function hideTyping() {
+  var t = document.getElementById('typingIndicator');
+  if (t) t.remove();
+}
+
+async function sendMessage() {
+  var text = inputEl.value.trim();
+  if (!text || isBusy) return;
+  inputEl.value = '';
+  inputEl.style.height = 'auto';
+  isBusy = true;
+  sendBtn.disabled = true;
+  addMessage('user', text);
+  showTyping();
+  try {
+    var response = await fetch('/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text})
+    });
+    var data = await response.json();
+    hideTyping();
+    addMessage('ai', data.reply || 'Error: ' + (data.error || 'unknown'));
+  } catch(err) {
+    hideTyping();
+    addMessage('ai', 'Could not reach ARIA. Try again!');
+  }
+  isBusy = false;
+  sendBtn.disabled = false;
+  inputEl.focus();
+}
+
+inputEl.focus();
 </script>
 </body>
 </html>"""
