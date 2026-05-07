@@ -120,7 +120,7 @@ function addMessage(role, text) {
   div.className = 'msg ' + role;
   var icon = (role === 'ai') ? 'AI' : 'ME';
   var name = (role === 'ai') ? 'ARIA' : 'YOU';
-  var safe = text.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+  var safe = text.split('<').join('&lt;').split('>').join('&gt;').split('\n').join('<br>');
   div.innerHTML = '<div class="mav">' + icon + '</div><div class="mc"><div class="mn">' + name + '</div><div class="mb">' + safe + '</div><div class="mt">' + getTime() + '</div></div>';
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
