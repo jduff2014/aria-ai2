@@ -1,4 +1,0 @@
-flask
-anthropic
-colorama
-gunicorn
