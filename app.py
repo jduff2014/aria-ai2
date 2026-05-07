@@ -95,7 +95,7 @@ textarea::placeholder { color: #2a4a2a; }
 <div class='aria-visual'>
   <div class='aria-name'>NI-VIBES</div>
   <div class='aria-img-wrap'>
-    <img id='ariaImg' src='https://i.imgur.com/c7NDuKa.jpeg' alt='ARIA' crossorigin='anonymous'>
+    <img id='ariaImg' src='https://i.postimg.cc/Ls3JkRhV/Chat-GPT-Image-May-7-2026-11-59-14-AM.png' alt='ARIA' crossorigin='anonymous'>
     <canvas id='glowCanvas'></canvas>
   </div>
   <div class='aria-status' id='ariaStatus'>STANDBY</div>
