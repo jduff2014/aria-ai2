@@ -1,11 +1,12 @@
 from flask import Flask, request, jsonify
-import json, os, datetime, anthropic
+import json, os, datetime, anthropic, base64, threading
 from pathlib import Path
 
 app = Flask(__name__)
 MEMORY_FILE = "/tmp/memory.json"
 PROFILE_FILE = "/tmp/profile.json"
 session_history = []
+processing_jobs = {}
 
 def load_json(path, default):
     try:
@@ -26,227 +27,241 @@ def save_json(path, data):
 def default_profile():
     return {"name": None, "interests": [], "facts": [], "games": ["snake", "flappy bird", "pacman"], "printer": "Ender 3 S1 Pro", "conversations": 0, "first_met": str(datetime.date.today())}
 
+def analyze_and_split_stl(stl_data, filename, job_id):
+    try:
+        import struct, math
+        if len(stl_data) < 84:
+            processing_jobs[job_id] = {"status": "error", "message": "Invalid STL file"}
+            return
+        is_binary = not stl_data[:5].decode('ascii', errors='ignore').lower().startswith('solid') or len(stl_data) > 1000
+        if is_binary:
+            num_triangles = struct.unpack('<I', stl_data[80:84])[0]
+        else:
+            content = stl_data.decode('utf-8', errors='ignore')
+            num_triangles = content.count('facet normal')
+        min_x = min_y = min_z = float('inf')
+        max_x = max_y = max_z = float('-inf')
+        if is_binary and len(stl_data) >= 84 + num_triangles * 50:
+            for i in range(min(num_triangles, 10000)):
+                offset = 84 + i * 50
+                for v in range(3):
+                    voffset = offset + 12 + v * 12
+                    if voffset + 12 <= len(stl_data):
+                        x, y, z = struct.unpack('<fff', stl_data[voffset:voffset+12])
+                        if abs(x) < 1e10:
+                            min_x = min(min_x, x); max_x = max(max_x, x)
+                            min_y = min(min_y, y); max_y = max(max_y, y)
+                            min_z = min(min_z, z); max_z = max(max_z, z)
+        if min_x == float('inf'):
+            min_x = min_y = min_z = 0
+            max_x = max_y = max_z = 100
+        size_x = max_x - min_x
+        size_y = max_y - min_y
+        size_z = max_z - min_z
+        MAX_X, MAX_Y, MAX_Z = 220, 220, 270
+        cuts_x = max(1, math.ceil(size_x / MAX_X))
+        cuts_y = max(1, math.ceil(size_y / MAX_Y))
+        cuts_z = max(1, math.ceil(size_z / MAX_Z))
+        total_pieces = cuts_x * cuts_y * cuts_z
+        pieces = []
+        piece_num = 1
+        for ix in range(cuts_x):
+            for iy in range(cuts_y):
+                for iz in range(cuts_z):
+                    pieces.append({"piece": piece_num, "size": str(round(size_x/cuts_x,1)) + " x " + str(round(size_y/cuts_y,1)) + " x " + str(round(size_z/cuts_z,1)) + " mm"})
+                    piece_num += 1
+        processing_jobs[job_id] = {"status": "complete", "filename": filename, "analysis": {"size_x": round(size_x,1), "size_y": round(size_y,1), "size_z": round(size_z,1), "total_pieces": total_pieces, "triangles": num_triangles, "fits": total_pieces == 1}, "pieces": pieces}
+    except Exception as e:
+        processing_jobs[job_id] = {"status": "error", "message": str(e)}
+
 HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset='UTF-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no'>
 <meta name='apple-mobile-web-app-capable' content='yes'>
+<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>
 <title>ARIA</title>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #050810; color: #e2e8f8; font-family: Courier New, monospace; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+* { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html { height: 100%; }
+body { background: #050810; color: #e2e8f8; font-family: -apple-system, Courier New, monospace; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
 
-.aria-visual { flex-shrink: 0; background: #050810; display: flex; flex-direction: column; align-items: center; padding: 10px 0 6px; border-bottom: 1px solid #1a2e1a; position: relative; overflow: hidden; height: 280px; }
+/* ARIA HEADER */
+.aria-header { flex-shrink: 0; background: #050810; border-bottom: 1px solid #1a2e1a; position: relative; overflow: hidden; }
+.aria-header::before { content: ''; position: absolute; inset: 0; background: radial-gradient(ellipse at 50% 100%, rgba(0,255,80,0.08) 0%, transparent 70%); pointer-events: none; }
+.aria-inner { display: flex; align-items: center; gap: 12px; padding: 10px 16px; position: relative; z-index: 2; }
+.aria-img-wrap { position: relative; width: 56px; height: 56px; flex-shrink: 0; }
+.aria-img-wrap img { width: 100%; height: 100%; object-fit: cover; object-position: center top; border-radius: 50%; border: 2px solid #00ff50; box-shadow: 0 0 12px rgba(0,255,80,0.4); }
+#glowCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 50%; pointer-events: none; }
+.aria-info { flex: 1; }
+.aria-name { font-size: 18px; font-weight: bold; letter-spacing: 4px; color: #00ff50; text-shadow: 0 0 15px rgba(0,255,80,0.7); }
+.aria-status { font-size: 10px; letter-spacing: 2px; color: #4a7a4a; margin-top: 2px; display: flex; align-items: center; gap: 5px; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: #00ff50; animation: blink 2s infinite; flex-shrink: 0; }
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.2; } }
+.aria-status.talking .status-dot { animation: fastblink 0.4s infinite; background: #adff2f; }
+@keyframes fastblink { 0%,100% { opacity: 1; } 50% { opacity: 0.1; } }
+.aria-tag { font-size: 9px; letter-spacing: 1px; color: #2a4a2a; margin-top: 2px; }
 
-.aria-visual::before { content: ''; position: absolute; inset: 0; background: radial-gradient(ellipse at 50% 100%, rgba(0,255,80,0.1) 0%, transparent 70%); pointer-events: none; z-index: 0; }
-
-.aria-name { font-size: 16px; font-weight: bold; letter-spacing: 6px; color: #00ff50; text-shadow: 0 0 20px rgba(0,255,80,0.8), 0 0 40px rgba(0,255,80,0.4); position: relative; z-index: 2; margin-bottom: 6px; }
-
-.aria-img-wrap { position: relative; z-index: 2; width: 160px; height: 200px; }
-
-.aria-img-wrap img { width: 100%; height: 100%; object-fit: cover; object-position: center top; border-radius: 8px; filter: brightness(0.9) contrast(1.1); }
-
-/* Glow overlay canvas on top of image */
-#glowCanvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 8px; pointer-events: none; }
-
-/* Scanline effect */
-.aria-img-wrap::after { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px); border-radius: 8px; pointer-events: none; z-index: 3; }
-
-.aria-status { font-size: 9px; letter-spacing: 3px; color: #00ff50; margin-top: 5px; position: relative; z-index: 2; text-shadow: 0 0 8px #00ff50; }
-.aria-status.talking { animation: statusPulse 0.4s ease-in-out infinite; }
-@keyframes statusPulse { 0%,100% { opacity: 1; text-shadow: 0 0 8px #00ff50; } 50% { opacity: 0.3; text-shadow: 0 0 20px #00ff50; } }
-
-.msgs { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; background: #050810; }
-.msgs::-webkit-scrollbar { width: 2px; }
-.msgs::-webkit-scrollbar-thumb { background: #1a2e1a; }
-.msg { display: flex; gap: 8px; }
+/* MESSAGES */
+.msgs { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px 14px 8px; display: flex; flex-direction: column; gap: 10px; -webkit-overflow-scrolling: touch; scroll-behavior: smooth; }
+.msgs::-webkit-scrollbar { display: none; }
+.msg { display: flex; gap: 8px; animation: fadeUp 0.25s ease forwards; opacity: 0; }
+@keyframes fadeUp { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform: translateY(0); } }
 .msg.user { flex-direction: row-reverse; }
-.mav { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: bold; flex-shrink: 0; color: #050810; }
-.msg.ai .mav { background: linear-gradient(135deg, #00ff50, #adff2f); box-shadow: 0 0 8px rgba(0,255,80,0.5); }
+.mav { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: bold; flex-shrink: 0; color: #050810; margin-top: 2px; }
+.msg.ai .mav { background: linear-gradient(135deg, #00ff50, #adff2f); box-shadow: 0 0 8px rgba(0,255,80,0.4); }
 .msg.user .mav { background: linear-gradient(135deg, #a78bfa, #f472b6); }
-.mc { max-width: 80%; }
-.mn { font-size: 8px; letter-spacing: 2px; color: #2a4a2a; margin-bottom: 3px; text-transform: uppercase; }
+.mc { max-width: 82%; }
+.mn { font-size: 9px; letter-spacing: 2px; color: #2a4a2a; margin-bottom: 4px; text-transform: uppercase; }
 .msg.user .mn { text-align: right; }
-.mb { padding: 9px 13px; border-radius: 14px; font-size: 13px; line-height: 1.6; }
-.msg.ai .mb { background: #0a150a; border: 1px solid #1a3a1a; border-top-left-radius: 3px; color: #c8f0c8; }
-.msg.user .mb { background: #1a1540; border: 1px solid rgba(167,139,250,0.2); border-top-right-radius: 3px; }
-.mt { font-size: 8px; color: #2a4a2a; margin-top: 3px; }
+.mb { padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.55; word-break: break-word; }
+.msg.ai .mb { background: #0a150a; border: 1px solid #1a3a1a; border-top-left-radius: 4px; color: #c8f0c8; }
+.msg.user .mb { background: #1a1540; border: 1px solid rgba(167,139,250,0.25); border-top-right-radius: 4px; color: #e2e8f8; }
+.mt { font-size: 9px; color: #2a4a2a; margin-top: 4px; }
 .msg.user .mt { text-align: right; }
-.typing { display: flex; gap: 4px; align-items: center; padding: 10px 13px; }
-.td { width: 6px; height: 6px; border-radius: 50%; background: #00ff50; animation: bounce 1.2s ease-in-out infinite; }
+
+/* TYPING */
+.typing { display: flex; gap: 5px; align-items: center; padding: 12px 14px; }
+.td { width: 7px; height: 7px; border-radius: 50%; background: #00ff50; animation: bounce 1.2s ease-in-out infinite; }
 .td:nth-child(2) { animation-delay: 0.2s; }
 .td:nth-child(3) { animation-delay: 0.4s; }
-@keyframes bounce { 0%,60%,100% { transform: translateY(0); opacity: 0.3; } 30% { transform: translateY(-5px); opacity: 1; } }
+@keyframes bounce { 0%,60%,100% { transform: translateY(0); opacity: 0.3; } 30% { transform: translateY(-6px); opacity: 1; } }
 
-.inp { padding: 10px 14px; padding-bottom: max(10px, env(safe-area-inset-bottom)); border-top: 1px solid #1a2e1a; background: #050810; display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0; }
-.iw { flex: 1; background: #0a150a; border: 1px solid #1a3a1a; border-radius: 18px; padding: 9px 14px; transition: border-color 0.2s; }
-.iw:focus-within { border-color: rgba(0,255,80,0.5); box-shadow: 0 0 12px rgba(0,255,80,0.08); }
-textarea { background: none; border: none; outline: none; color: #c8f0c8; font-family: Courier New, monospace; font-size: 13px; line-height: 1.5; resize: none; width: 100%; max-height: 100px; min-height: 20px; }
+/* STL CARD */
+.stl-card { background: #050e05; border: 1px solid #00ff50; border-radius: 12px; padding: 12px; margin-top: 4px; }
+.stl-card h4 { color: #00ff50; letter-spacing: 2px; font-size: 10px; margin-bottom: 8px; text-transform: uppercase; }
+.stl-info { font-size: 12px; color: #8ab88a; margin-bottom: 6px; }
+.stl-piece { background: #0a150a; border: 1px solid #1a3a1a; border-radius: 8px; padding: 7px 10px; margin-top: 5px; font-size: 12px; color: #c8f0c8; display: flex; justify-content: space-between; align-items: center; }
+.stl-piece .pnum { color: #00ff50; font-weight: bold; font-size: 11px; }
+.fits-badge { background: rgba(0,255,80,0.15); border: 1px solid #00ff50; color: #00ff50; border-radius: 20px; padding: 4px 10px; font-size: 11px; letter-spacing: 1px; display: inline-block; margin-top: 6px; }
+
+/* INPUT */
+.inp-wrap { flex-shrink: 0; background: #050810; border-top: 1px solid #1a2e1a; padding: 10px 12px; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+.inp-row { display: flex; gap: 8px; align-items: flex-end; }
+.upload-btn { width: 42px; height: 42px; border-radius: 50%; background: #0a150a; border: 1px solid #1a3a1a; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; transition: all 0.2s; }
+.upload-btn:active { border-color: #00ff50; transform: scale(0.92); }
+#fileInput { display: none; }
+.iw { flex: 1; background: #0a150a; border: 1px solid #1a3a1a; border-radius: 22px; padding: 10px 16px; transition: border-color 0.2s; min-height: 42px; display: flex; align-items: center; }
+.iw:focus-within { border-color: rgba(0,255,80,0.5); box-shadow: 0 0 10px rgba(0,255,80,0.06); }
+textarea { background: none; border: none; outline: none; color: #c8f0c8; font-family: -apple-system, Courier New, monospace; font-size: 15px; line-height: 1.4; resize: none; width: 100%; max-height: 120px; min-height: 22px; display: block; }
 textarea::placeholder { color: #2a4a2a; }
-.sb { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg, #00ff50, #adff2f); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 0 15px rgba(0,255,80,0.4); }
-.sb:active { transform: scale(0.9); }
-.sb:disabled { opacity: 0.4; }
-.sb svg { width: 16px; height: 16px; fill: #050810; }
+.sb { width: 42px; height: 42px; border-radius: 50%; background: linear-gradient(135deg, #00ff50, #adff2f); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; box-shadow: 0 0 14px rgba(0,255,80,0.35); transition: all 0.2s; }
+.sb:active { transform: scale(0.9); box-shadow: 0 0 20px rgba(0,255,80,0.6); }
+.sb:disabled { opacity: 0.35; }
+.sb svg { width: 18px; height: 18px; fill: #050810; }
 </style>
 </head>
 <body>
 
-<div class='aria-visual'>
-  <div class='aria-name'>NI-VIBES</div>
-  <div class='aria-img-wrap'>
-    <img id='ariaImg' src='https://i.postimg.cc/Ls3JkRhV/Chat-GPT-Image-May-7-2026-11-59-14-AM.png' alt='ARIA' crossorigin='anonymous'>
-    <canvas id='glowCanvas'></canvas>
+<!-- HEADER -->
+<div class='aria-header'>
+  <div class='aria-inner'>
+    <div class='aria-img-wrap'>
+      <img src='https://i.postimg.cc/Ls3JkRhV/Chat-GPT-Image-May-7-2026-11-59-14-AM.png' alt='ARIA'>
+      <canvas id='glowCanvas'></canvas>
+    </div>
+    <div class='aria-info'>
+      <div class='aria-name'>NI-VIBES</div>
+      <div class='aria-status' id='ariaStatus'><div class='status-dot'></div><span id='statusText'>ONLINE</span></div>
+      <div class='aria-tag'>SENTINEL CLASS · MEMORY ACTIVE</div>
+    </div>
   </div>
-  <div class='aria-status' id='ariaStatus'>STANDBY</div>
 </div>
 
+<!-- MESSAGES -->
 <div class='msgs' id='msgContainer'></div>
 
-<div class='inp'>
-  <div class='iw'><textarea id='userInput' placeholder='Talk to ARIA...' rows='1'></textarea></div>
-  <button class='sb' id='sendBtn'><svg viewBox='0 0 24 24'><path d='M2.01 21L23 12 2.01 3 2 10l15 2-15 2z'/></svg></button>
+<!-- INPUT -->
+<div class='inp-wrap'>
+  <div class='inp-row'>
+    <label class='upload-btn' for='fileInput'>📎</label>
+    <input type='file' id='fileInput' accept='.stl'>
+    <div class='iw'>
+      <textarea id='userInput' placeholder='Talk to ARIA...' rows='1'></textarea>
+    </div>
+    <button class='sb' id='sendBtn'>
+      <svg viewBox='0 0 24 24'><path d='M2.01 21L23 12 2.01 3 2 10l15 2-15 2z'/></svg>
+    </button>
+  </div>
 </div>
 
 <script>
-var glowCanvas = document.getElementById('glowCanvas');
-var gctx = glowCanvas.getContext('2d');
+// GLOW ANIMATION
+var gc = document.getElementById('glowCanvas');
+var gx = gc.getContext('2d');
 var tick = 0;
-var isTalking = false;
-var glowVal = 0;
+var talking = false;
+var glow = 0;
 
 function resizeGlow() {
-  var wrap = document.querySelector('.aria-img-wrap');
-  glowCanvas.width = wrap.offsetWidth;
-  glowCanvas.height = wrap.offsetHeight;
+  gc.width = gc.offsetWidth;
+  gc.height = gc.offsetHeight;
 }
-
 resizeGlow();
-window.addEventListener('resize', resizeGlow);
 
 function animateGlow() {
-  tick += 0.04;
-  var W = glowCanvas.width;
-  var H = glowCanvas.height;
-  gctx.clearRect(0, 0, W, H);
-
-  var target = isTalking ? 0.85 : 0.25 + Math.sin(tick) * 0.1;
-  glowVal += (target - glowVal) * 0.06;
-
-  // Eye glow positions (approximate for the NI-VIBES character face)
-  var eyeY = H * 0.18;
-  var eyeSpread = W * 0.12;
-  var cx = W / 2;
-
-  // Left eye glow
-  var leftEye = gctx.createRadialGradient(cx - eyeSpread, eyeY, 1, cx - eyeSpread, eyeY, 18);
-  leftEye.addColorStop(0, 'rgba(0,255,80,' + (glowVal * 1.2) + ')');
-  leftEye.addColorStop(0.5, 'rgba(0,255,80,' + (glowVal * 0.4) + ')');
-  leftEye.addColorStop(1, 'rgba(0,255,80,0)');
-  gctx.fillStyle = leftEye;
-  gctx.fillRect(cx - eyeSpread - 18, eyeY - 18, 36, 36);
-
-  // Right eye glow
-  var rightEye = gctx.createRadialGradient(cx + eyeSpread, eyeY, 1, cx + eyeSpread, eyeY, 18);
-  rightEye.addColorStop(0, 'rgba(0,255,80,' + (glowVal * 1.2) + ')');
-  rightEye.addColorStop(0.5, 'rgba(0,255,80,' + (glowVal * 0.4) + ')');
-  rightEye.addColorStop(1, 'rgba(0,255,80,0)');
-  gctx.fillStyle = rightEye;
-  gctx.fillRect(cx + eyeSpread - 18, eyeY - 18, 36, 36);
-
-  // Circuit lines that pulse
-  gctx.strokeStyle = 'rgba(0,255,80,' + (glowVal * 0.7) + ')';
-  gctx.lineWidth = 1;
-  gctx.shadowColor = '#00ff50';
-  gctx.shadowBlur = 6 * glowVal;
-
-  // Chest lightning bolt glow
-  var chestY = H * 0.55;
-  gctx.beginPath();
-  gctx.moveTo(cx - 8, chestY - 15);
-  gctx.lineTo(cx + 4, chestY);
-  gctx.lineTo(cx - 4, chestY);
-  gctx.lineTo(cx + 8, chestY + 15);
-  gctx.stroke();
-
-  // Circuit lines on suit
-  gctx.lineWidth = 0.8;
-
-  // Left shoulder
-  gctx.beginPath();
-  gctx.moveTo(W * 0.15, H * 0.45);
-  gctx.lineTo(W * 0.22, H * 0.45);
-  gctx.lineTo(W * 0.22, H * 0.52);
-  gctx.stroke();
-
-  // Right shoulder
-  gctx.beginPath();
-  gctx.moveTo(W * 0.85, H * 0.45);
-  gctx.lineTo(W * 0.78, H * 0.45);
-  gctx.lineTo(W * 0.78, H * 0.52);
-  gctx.stroke();
-
-  // Left arm line
-  gctx.beginPath();
-  gctx.moveTo(W * 0.14, H * 0.55);
-  gctx.lineTo(W * 0.14, H * 0.72);
-  gctx.stroke();
-
-  // Right arm line
-  gctx.beginPath();
-  gctx.moveTo(W * 0.86, H * 0.55);
-  gctx.lineTo(W * 0.86, H * 0.72);
-  gctx.stroke();
-
-  // Center chest vertical
-  gctx.beginPath();
-  gctx.moveTo(cx, H * 0.42);
-  gctx.lineTo(cx, H * 0.75);
-  gctx.stroke();
-
-  // Overall image glow border when talking
-  if (isTalking) {
-    var borderGlow = gctx.createLinearGradient(0, 0, W, H);
-    borderGlow.addColorStop(0, 'rgba(0,255,80,' + (glowVal * 0.3) + ')');
-    borderGlow.addColorStop(0.5, 'rgba(0,255,80,' + (glowVal * 0.6) + ')');
-    borderGlow.addColorStop(1, 'rgba(0,255,80,' + (glowVal * 0.3) + ')');
-    gctx.strokeStyle = borderGlow;
-    gctx.lineWidth = 3;
-    gctx.shadowBlur = 15;
-    gctx.strokeRect(1, 1, W - 2, H - 2);
-  }
-
-  gctx.shadowBlur = 0;
+  tick += 0.05;
+  var W = gc.width, H = gc.height;
+  gx.clearRect(0, 0, W, H);
+  var target = talking ? 0.9 : 0.3 + Math.sin(tick) * 0.12;
+  glow += (target - glow) * 0.07;
+  var cx = W/2, cy = H/2;
+  var rim = gx.createRadialGradient(cx, cy, W*0.35, cx, cy, W*0.5);
+  rim.addColorStop(0, 'rgba(0,255,80,0)');
+  rim.addColorStop(0.7, 'rgba(0,255,80,' + (glow*0.4) + ')');
+  rim.addColorStop(1, 'rgba(0,255,80,' + (glow*0.8) + ')');
+  gx.fillStyle = rim;
+  gx.beginPath();
+  gx.arc(cx, cy, W*0.5, 0, Math.PI*2);
+  gx.fill();
+  var eyeY = H * 0.3;
+  var eg = gx.createRadialGradient(cx-W*0.13, eyeY, 0, cx-W*0.13, eyeY, W*0.12);
+  eg.addColorStop(0, 'rgba(0,255,80,' + (glow*0.9) + ')');
+  eg.addColorStop(1, 'rgba(0,255,80,0)');
+  gx.fillStyle = eg;
+  gx.fillRect(cx-W*0.25, eyeY-W*0.12, W*0.24, W*0.24);
+  var eg2 = gx.createRadialGradient(cx+W*0.13, eyeY, 0, cx+W*0.13, eyeY, W*0.12);
+  eg2.addColorStop(0, 'rgba(0,255,80,' + (glow*0.9) + ')');
+  eg2.addColorStop(1, 'rgba(0,255,80,0)');
+  gx.fillStyle = eg2;
+  gx.fillRect(cx+W*0.01, eyeY-W*0.12, W*0.24, W*0.24);
   requestAnimationFrame(animateGlow);
 }
-
 animateGlow();
 
-// ── CHAT ─────────────────────────────────────────────────────────────────────
+// CHAT
 var container = document.getElementById('msgContainer');
 var inputBox = document.getElementById('userInput');
-var sendButton = document.getElementById('sendBtn');
+var sendBtn = document.getElementById('sendBtn');
 var statusEl = document.getElementById('ariaStatus');
+var statusText = document.getElementById('statusText');
+var fileInput = document.getElementById('fileInput');
 var busy = false;
 
-function setStatus(text, talking) {
-  statusEl.textContent = text;
-  isTalking = talking;
-  statusEl.className = talking ? 'aria-status talking' : 'aria-status';
+function setStatus(text, isTalking) {
+  statusText.textContent = text;
+  talking = isTalking;
+  statusEl.className = isTalking ? 'aria-status talking' : 'aria-status';
 }
 
 function getTime() {
-  return new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  return new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
 }
 
-function addMessage(role, text) {
+function addMsg(role, content, isHtml) {
   var div = document.createElement('div');
   div.className = 'msg ' + role;
-  var icon = (role === 'ai') ? 'AI' : 'ME';
-  var name = (role === 'ai') ? 'ARIA' : 'YOU';
-  var safe = document.createElement('div');
-  safe.textContent = text;
-  var html = safe.innerHTML;
+  var icon = role === 'ai' ? 'AI' : 'ME';
+  var name = role === 'ai' ? 'ARIA' : 'YOU';
+  var html;
+  if (isHtml) {
+    html = content;
+  } else {
+    var tmp = document.createElement('div');
+    tmp.textContent = content;
+    html = tmp.innerHTML;
+  }
   div.innerHTML = '<div class="mav">' + icon + '</div><div class="mc"><div class="mn">' + name + '</div><div class="mb">' + html + '</div><div class="mt">' + getTime() + '</div></div>';
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
@@ -263,41 +278,94 @@ function showTyping() {
 
 function hideTyping() {
   var t = document.getElementById('typingDiv');
-  if (t) { t.remove(); }
+  if (t) t.remove();
 }
 
 function send() {
   var text = inputBox.value.trim();
-  if (!text || busy) { return; }
+  if (!text || busy) return;
   inputBox.value = '';
   inputBox.style.height = 'auto';
   busy = true;
-  sendButton.disabled = true;
-  addMessage('user', text);
+  sendBtn.disabled = true;
+  addMsg('user', text, false);
   showTyping();
-  setStatus('PROCESSING...', true);
-
-  fetch('/chat', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({message: text})
-  })
+  setStatus('THINKING...', true);
+  fetch('/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({message:text})})
   .then(function(r) { return r.json(); })
-  .then(function(data) {
+  .then(function(d) {
     hideTyping();
-    addMessage('ai', data.reply || ('Error: ' + (data.error || 'unknown')));
+    addMsg('ai', d.reply || ('Error: ' + (d.error||'unknown')), false);
     setStatus('ONLINE', false);
     busy = false;
-    sendButton.disabled = false;
+    sendBtn.disabled = false;
     inputBox.focus();
   })
   .catch(function() {
     hideTyping();
-    addMessage('ai', 'Could not reach ARIA. Try again!');
-    setStatus('STANDBY', false);
+    addMsg('ai', 'Connection lost. Try again.', false);
+    setStatus('ONLINE', false);
     busy = false;
-    sendButton.disabled = false;
+    sendBtn.disabled = false;
   });
+}
+
+fileInput.addEventListener('change', function() {
+  var file = fileInput.files[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.stl')) {
+    addMsg('ai', 'STL files only right now.', false);
+    return;
+  }
+  addMsg('user', 'Uploaded: ' + file.name, false);
+  addMsg('ai', 'Got it — analyzing your model. Keep chatting, I will let you know when I am done.', false);
+  setStatus('ANALYZING...', true);
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var arr = new Uint8Array(e.target.result);
+    var str = '';
+    for (var i = 0; i < arr.length; i++) str += String.fromCharCode(arr[i]);
+    var b64 = btoa(str);
+    fetch('/analyze_stl', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({filename:file.name, data:b64})})
+    .then(function(r) { return r.json(); })
+    .then(function(d) { if (d.job_id) pollJob(d.job_id); });
+  };
+  reader.readAsArrayBuffer(file);
+  fileInput.value = '';
+});
+
+function pollJob(id) {
+  setTimeout(function() {
+    fetch('/job_status/' + id)
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.status === 'processing') { pollJob(id); return; }
+      setStatus('ONLINE', false);
+      if (d.status === 'complete') {
+        showSTLResult(d);
+      } else {
+        addMsg('ai', 'Had trouble with that file. Try again.', false);
+      }
+    });
+  }, 1500);
+}
+
+function showSTLResult(d) {
+  var a = d.analysis;
+  var html = '<div class="stl-card"><h4>' + d.filename + '</h4>';
+  html += '<div class="stl-info">Size: ' + a.size_x + ' x ' + a.size_y + ' x ' + a.size_z + ' mm &nbsp;|&nbsp; ' + a.triangles.toLocaleString() + ' triangles</div>';
+  if (a.fits) {
+    html += '<div class="fits-badge">FITS BED — PRINT AS ONE PIECE</div>';
+  } else {
+    html += '<div class="stl-info">Optimal split: <b style="color:#00ff50">' + a.total_pieces + ' pieces</b></div>';
+    for (var i = 0; i < d.pieces.length; i++) {
+      html += '<div class="stl-piece"><span class="pnum">PIECE ' + d.pieces[i].piece + '</span><span>' + d.pieces[i].size + '</span></div>';
+    }
+  }
+  html += '</div>';
+  addMsg('ai', html, true);
+  var msg = a.fits ? 'Your model fits the Ender 3 S1 Pro as one piece — just open it in OrcaSlicer and print!' : 'Split into ' + a.total_pieces + ' pieces, each fits your bed. Slice each one separately in OrcaSlicer then glue together.';
+  addMsg('ai', msg, false);
 }
 
 inputBox.addEventListener('keydown', function(e) {
@@ -305,15 +373,14 @@ inputBox.addEventListener('keydown', function(e) {
 });
 inputBox.addEventListener('input', function() {
   inputBox.style.height = 'auto';
-  inputBox.style.height = Math.min(inputBox.scrollHeight, 100) + 'px';
+  inputBox.style.height = Math.min(inputBox.scrollHeight, 120) + 'px';
 });
-sendButton.addEventListener('click', send);
-inputBox.focus();
+sendButton = sendBtn;
+sendBtn.addEventListener('click', send);
 
 setTimeout(function() {
-  addMessage('ai', 'Systems online. NI-VIBES sentinel active. What do you need?');
-  setStatus('ONLINE', false);
-}, 800);
+  addMsg('ai', 'Hey. Systems online. Chat with me or tap the clip to upload an STL for splitting.', false);
+}, 600);
 </script>
 </body>
 </html>"""
@@ -322,74 +389,74 @@ setTimeout(function() {
 def index():
     return HTML_PAGE
 
+@app.route("/analyze_stl", methods=["POST"])
+def analyze_stl():
+    data = request.json
+    filename = data.get("filename", "model.stl")
+    try:
+        stl_data = base64.b64decode(data.get("data", ""))
+    except:
+        return jsonify({"error": "invalid file"}), 400
+    job_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    processing_jobs[job_id] = {"status": "processing"}
+    t = threading.Thread(target=analyze_and_split_stl, args=(stl_data, filename, job_id))
+    t.daemon = True
+    t.start()
+    return jsonify({"job_id": job_id})
+
+@app.route("/job_status/<job_id>")
+def job_status(job_id):
+    return jsonify(processing_jobs.get(job_id, {"status": "not_found"}))
+
 @app.route("/chat", methods=["POST"])
 def chat():
     global session_history
     user_msg = request.json.get("message", "").strip()
     if not user_msg:
         return jsonify({"error": "empty"}), 400
-
     memory = load_json(MEMORY_FILE, [])
     profile = load_json(PROFILE_FILE, default_profile())
     profile["conversations"] += 1
-
-    ctx = "Name: " + str(profile.get("name", "unknown"))
-    ctx += "\nInterests: " + str(profile.get("interests", []))
-    ctx += "\nPrinter: Ender 3 S1 Pro"
-    ctx += "\nGames built: snake, flappy bird, pacman"
-    ctx += "\nConversations: " + str(profile["conversations"])
-    ctx += "\nUser has RTX 2060, 36GB RAM, builds DQN game AI agents."
-
+    ctx = "Name: " + str(profile.get("name","unknown")) + "\nInterests: " + str(profile.get("interests",[])) + "\nPrinter: Ender 3 S1 Pro\nGames built: snake, flappy bird, pacman\nConversations: " + str(profile["conversations"]) + "\nUser has RTX 2060, 36GB RAM, builds DQN game AI agents."
     if memory:
         ctx += "\n\nRecent chats:"
         for m in memory[-6:]:
-            ctx += "\nUser: " + m["user"]
-            ctx += "\nARIA: " + m["assistant"][:120]
-
-    system = "You are ARIA, a cyberpunk AI sentinel. NI-VIBES class. You are feminine, confident, smooth and natural — talk like a real woman, not a robot. Keep responses SHORT, max 2 sentences. No narrating actions, no asterisks, no robotic phrases. Just talk directly and naturally like a real person who happens to be an AI. Remember everything about this person.\n\nWHAT YOU KNOW:\n" + ctx
-
+            ctx += "\nUser: " + m["user"] + "\nARIA: " + m["assistant"][:120]
+    system = "You are ARIA, a cyberpunk AI sentinel. NI-VIBES class. You are feminine, confident, smooth and natural — talk like a real woman, not a robot. Keep responses SHORT, max 2 sentences. No narrating actions, no asterisks, no robotic phrases. Just talk directly and naturally. Remember everything about this person.\n\nWHAT YOU KNOW:\n" + ctx
     messages = []
     for h in session_history[-8:]:
-        messages.append({"role": "user", "content": h["user"]})
-        messages.append({"role": "assistant", "content": h["assistant"]})
-    messages.append({"role": "user", "content": user_msg})
-
+        messages.append({"role":"user","content":h["user"]})
+        messages.append({"role":"assistant","content":h["assistant"]})
+    messages.append({"role":"user","content":user_msg})
     try:
         client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         res = client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=400, system=system, messages=messages)
         reply = res.content[0].text
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-    ex = {"user": user_msg, "assistant": reply, "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
+    ex = {"user":user_msg,"assistant":reply,"date":datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
     session_history.append(ex)
     memory.append(ex)
-    if len(memory) > 500:
-        memory = memory[-500:]
-
+    if len(memory) > 500: memory = memory[-500:]
     ml = user_msg.lower()
-    for kw in ["i love", "i like", "i enjoy", "i play"]:
+    for kw in ["i love","i like","i enjoy","i play"]:
         if kw in ml:
-            idx = ml.find(kw) + len(kw)
+            idx = ml.find(kw)+len(kw)
             interest = user_msg[idx:idx+40].strip(".,!? ").lower()
-            if interest and interest not in profile["interests"]:
-                profile["interests"].append(interest)
+            if interest and interest not in profile["interests"]: profile["interests"].append(interest)
     if "my name is" in ml:
         words = user_msg.split()
-        for i, w in enumerate(words):
-            if w.lower() == "is" and i + 1 < len(words):
-                n = words[i+1].strip(".,!?")
-                if len(n) > 1 and n[0].isupper():
-                    profile["name"] = n
-                    break
-
+        for i,w in enumerate(words):
+            if w.lower()=="is" and i+1<len(words):
+                n=words[i+1].strip(".,!?")
+                if len(n)>1 and n[0].isupper(): profile["name"]=n; break
     save_json(MEMORY_FILE, memory[-500:])
     save_json(PROFILE_FILE, profile)
     return jsonify({"reply": reply})
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status":"ok"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
