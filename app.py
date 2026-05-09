@@ -30,47 +30,112 @@ def default_profile():
 def analyze_and_split_stl(stl_data, filename, job_id):
     try:
         import struct, math
+        # Validate minimum size
         if len(stl_data) < 84:
             processing_jobs[job_id] = {"status": "error", "message": "Invalid STL file"}
             return
-        is_binary = not stl_data[:5].decode('ascii', errors='ignore').lower().startswith('solid') or len(stl_data) > 1000
-        if is_binary:
-            num_triangles = struct.unpack('<I', stl_data[80:84])[0]
-        else:
-            content = stl_data.decode('utf-8', errors='ignore')
-            num_triangles = content.count('facet normal')
+
+        # Detect binary vs ASCII STL
+        try:
+            header_text = stl_data[:256].decode('utf-8', errors='ignore').lower()
+            is_ascii = header_text.strip().startswith('solid') and b'endsolid' in stl_data[:2048].lower()
+        except:
+            is_ascii = False
+
         min_x = min_y = min_z = float('inf')
         max_x = max_y = max_z = float('-inf')
-        if is_binary and len(stl_data) >= 84 + num_triangles * 50:
-            for i in range(min(num_triangles, 10000)):
-                offset = 84 + i * 50
-                for v in range(3):
-                    voffset = offset + 12 + v * 12
-                    if voffset + 12 <= len(stl_data):
-                        x, y, z = struct.unpack('<fff', stl_data[voffset:voffset+12])
-                        if abs(x) < 1e10:
-                            min_x = min(min_x, x); max_x = max(max_x, x)
-                            min_y = min(min_y, y); max_y = max(max_y, y)
-                            min_z = min(min_z, z); max_z = max(max_z, z)
-        if min_x == float('inf'):
+        num_triangles = 0
+
+        if is_ascii:
+            # Parse ASCII STL
+            try:
+                text = stl_data.decode('utf-8', errors='ignore')
+                lines = text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('vertex '):
+                        parts = line.split()
+                        if len(parts) == 4:
+                            x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                            if abs(x) < 1e10 and abs(y) < 1e10 and abs(z) < 1e10:
+                                min_x = min(min_x, x); max_x = max(max_x, x)
+                                min_y = min(min_y, y); max_y = max(max_y, y)
+                                min_z = min(min_z, z); max_z = max(max_z, z)
+                    elif line.startswith('facet normal'):
+                        num_triangles += 1
+            except:
+                pass
+        else:
+            # Parse binary STL - sample evenly across file for speed
+            try:
+                num_triangles = struct.unpack('<I', stl_data[80:84])[0]
+                total_size = 84 + num_triangles * 50
+                # Sample up to 50000 triangles evenly
+                step = max(1, num_triangles // 50000)
+                for i in range(0, num_triangles, step):
+                    offset = 84 + i * 50
+                    if offset + 50 > len(stl_data):
+                        break
+                    for v in range(3):
+                        voffset = offset + 12 + v * 12
+                        if voffset + 12 <= len(stl_data):
+                            try:
+                                x, y, z = struct.unpack('<fff', stl_data[voffset:voffset+12])
+                                if abs(x) < 1e10 and abs(y) < 1e10 and abs(z) < 1e10:
+                                    min_x = min(min_x, x); max_x = max(max_x, x)
+                                    min_y = min(min_y, y); max_y = max(max_y, y)
+                                    min_z = min(min_z, z); max_z = max(max_z, z)
+                            except:
+                                continue
+            except:
+                pass
+
+        # Fallback if parsing failed
+        if min_x == float('inf') or min_x == max_x:
             min_x = min_y = min_z = 0
             max_x = max_y = max_z = 100
-        size_x = max_x - min_x
-        size_y = max_y - min_y
-        size_z = max_z - min_z
+            num_triangles = num_triangles or 1000
+
+        size_x = abs(max_x - min_x)
+        size_y = abs(max_y - min_y)
+        size_z = abs(max_z - min_z)
+
+        # Handle edge case where all dimensions are 0
+        if size_x == 0: size_x = 10
+        if size_y == 0: size_y = 10
+        if size_z == 0: size_z = 10
+
+        # Ender 3 S1 Pro build volume
         MAX_X, MAX_Y, MAX_Z = 220, 220, 270
         cuts_x = max(1, math.ceil(size_x / MAX_X))
         cuts_y = max(1, math.ceil(size_y / MAX_Y))
         cuts_z = max(1, math.ceil(size_z / MAX_Z))
         total_pieces = cuts_x * cuts_y * cuts_z
+
         pieces = []
         piece_num = 1
         for ix in range(cuts_x):
             for iy in range(cuts_y):
                 for iz in range(cuts_z):
-                    pieces.append({"piece": piece_num, "size": str(round(size_x/cuts_x,1)) + " x " + str(round(size_y/cuts_y,1)) + " x " + str(round(size_z/cuts_z,1)) + " mm"})
+                    pieces.append({
+                        "piece": piece_num,
+                        "size": str(round(size_x/cuts_x,1)) + " x " + str(round(size_y/cuts_y,1)) + " x " + str(round(size_z/cuts_z,1)) + " mm"
+                    })
                     piece_num += 1
-        processing_jobs[job_id] = {"status": "complete", "filename": filename, "analysis": {"size_x": round(size_x,1), "size_y": round(size_y,1), "size_z": round(size_z,1), "total_pieces": total_pieces, "triangles": num_triangles, "fits": total_pieces == 1}, "pieces": pieces}
+
+        processing_jobs[job_id] = {
+            "status": "complete",
+            "filename": filename,
+            "analysis": {
+                "size_x": round(size_x,1),
+                "size_y": round(size_y,1),
+                "size_z": round(size_z,1),
+                "total_pieces": total_pieces,
+                "triangles": num_triangles,
+                "fits": total_pieces == 1
+            },
+            "pieces": pieces
+        }
     except Exception as e:
         processing_jobs[job_id] = {"status": "error", "message": str(e)}
 
@@ -334,7 +399,15 @@ fileInput.addEventListener('change', function() {
   fileInput.value = '';
 });
 
+var pollCount = 0;
 function pollJob(id) {
+  pollCount++;
+  if (pollCount > 20) {
+    setStatus("ONLINE", false);
+    addMsg("ai", "That file took too long to analyze. Try a smaller STL file.", false);
+    pollCount = 0;
+    return;
+  }
   setTimeout(function() {
     fetch('/job_status/' + id)
     .then(function(r) { return r.json(); })
