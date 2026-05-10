@@ -29,16 +29,14 @@ def default_profile():
 
 def analyze_and_split_stl(stl_data, filename, job_id):
     try:
-        import struct, math
-        # Validate minimum size
+        import struct, math, io, zipfile
         if len(stl_data) < 84:
             processing_jobs[job_id] = {"status": "error", "message": "Invalid STL file"}
             return
 
-        # Detect binary vs ASCII STL
+        # Detect binary vs ASCII
         try:
-            header_text = stl_data[:256].decode('utf-8', errors='ignore').lower()
-            is_ascii = header_text.strip().startswith('solid') and b'endsolid' in stl_data[:2048].lower()
+            is_ascii = stl_data[:5].decode('ascii', errors='ignore').lower() == 'solid' and len(stl_data) < 500000
         except:
             is_ascii = False
 
@@ -47,92 +45,127 @@ def analyze_and_split_stl(stl_data, filename, job_id):
         num_triangles = 0
 
         if is_ascii:
-            # Parse ASCII STL
             try:
                 text = stl_data.decode('utf-8', errors='ignore')
-                lines = text.split('\n')
-                for line in lines:
+                for line in text.split('\n'):
                     line = line.strip()
                     if line.startswith('vertex '):
                         parts = line.split()
                         if len(parts) == 4:
                             x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
-                            if abs(x) < 1e10 and abs(y) < 1e10 and abs(z) < 1e10:
-                                min_x = min(min_x, x); max_x = max(max_x, x)
-                                min_y = min(min_y, y); max_y = max(max_y, y)
-                                min_z = min(min_z, z); max_z = max(max_z, z)
+                            if abs(x) < 1e9:
+                                min_x=min(min_x,x); max_x=max(max_x,x)
+                                min_y=min(min_y,y); max_y=max(max_y,y)
+                                min_z=min(min_z,z); max_z=max(max_z,z)
                     elif line.startswith('facet normal'):
                         num_triangles += 1
             except:
                 pass
         else:
-            # Parse binary STL - sample evenly across file for speed
             try:
                 num_triangles = struct.unpack('<I', stl_data[80:84])[0]
-                total_size = 84 + num_triangles * 50
-                # Sample up to 50000 triangles evenly
-                step = max(1, num_triangles // 50000)
-                for i in range(0, num_triangles, step):
+                step = max(1, num_triangles // 10000)
+                for i in range(0, min(num_triangles, 500000), step):
                     offset = 84 + i * 50
-                    if offset + 50 > len(stl_data):
-                        break
+                    if offset + 50 > len(stl_data): break
                     for v in range(3):
-                        voffset = offset + 12 + v * 12
-                        if voffset + 12 <= len(stl_data):
+                        vo = offset + 12 + v * 12
+                        if vo + 12 <= len(stl_data):
                             try:
-                                x, y, z = struct.unpack('<fff', stl_data[voffset:voffset+12])
-                                if abs(x) < 1e10 and abs(y) < 1e10 and abs(z) < 1e10:
-                                    min_x = min(min_x, x); max_x = max(max_x, x)
-                                    min_y = min(min_y, y); max_y = max(max_y, y)
-                                    min_z = min(min_z, z); max_z = max(max_z, z)
+                                x, y, z = struct.unpack('<fff', stl_data[vo:vo+12])
+                                if abs(x) < 1e9:
+                                    min_x=min(min_x,x); max_x=max(max_x,x)
+                                    min_y=min(min_y,y); max_y=max(max_y,y)
+                                    min_z=min(min_z,z); max_z=max(max_z,z)
                             except:
                                 continue
             except:
                 pass
 
-        # Fallback if parsing failed
-        if min_x == float('inf') or min_x == max_x:
-            min_x = min_y = min_z = 0
-            max_x = max_y = max_z = 100
-            num_triangles = num_triangles or 1000
+        if min_x == float('inf'):
+            min_x=min_y=min_z=0; max_x=max_y=max_z=100; num_triangles=1000
 
-        size_x = abs(max_x - min_x)
-        size_y = abs(max_y - min_y)
-        size_z = abs(max_z - min_z)
+        size_x = max(1.0, abs(max_x - min_x))
+        size_y = max(1.0, abs(max_y - min_y))
+        size_z = max(1.0, abs(max_z - min_z))
 
-        # Handle edge case where all dimensions are 0
-        if size_x == 0: size_x = 10
-        if size_y == 0: size_y = 10
-        if size_z == 0: size_z = 10
-
-        # Ender 3 S1 Pro build volume
+        # Ender 3 S1 Pro - smart minimum cuts only along axes that need it
         MAX_X, MAX_Y, MAX_Z = 220, 220, 270
         cuts_x = max(1, math.ceil(size_x / MAX_X))
         cuts_y = max(1, math.ceil(size_y / MAX_Y))
         cuts_z = max(1, math.ceil(size_z / MAX_Z))
+
+        # Cap at reasonable number - max 12 pieces
+        while cuts_x * cuts_y * cuts_z > 12:
+            # Reduce the largest cut dimension first
+            if cuts_x >= cuts_y and cuts_x >= cuts_z and cuts_x > 1:
+                cuts_x -= 1
+            elif cuts_y >= cuts_x and cuts_y >= cuts_z and cuts_y > 1:
+                cuts_y -= 1
+            elif cuts_z > 1:
+                cuts_z -= 1
+            else:
+                break
+
         total_pieces = cuts_x * cuts_y * cuts_z
+        piece_w = round(size_x / cuts_x, 1)
+        piece_d = round(size_y / cuts_y, 1)
+        piece_h = round(size_z / cuts_z, 1)
 
         pieces = []
         piece_num = 1
         for ix in range(cuts_x):
             for iy in range(cuts_y):
                 for iz in range(cuts_z):
-                    pieces.append({
-                        "piece": piece_num,
-                        "size": str(round(size_x/cuts_x,1)) + " x " + str(round(size_y/cuts_y,1)) + " x " + str(round(size_z/cuts_z,1)) + " mm"
-                    })
+                    pieces.append({"piece": piece_num, "size": str(piece_w) + " x " + str(piece_d) + " x " + str(piece_h) + " mm"})
                     piece_num += 1
+
+        # Create a zip with cut plan text files
+        zip_buf = io.BytesIO()
+        base = filename.replace('.stl','').replace('.STL','')
+        with zipfile.ZipFile(zip_buf, 'w') as zf:
+            # Assembly guide
+            guide = "ARIA CUT PLAN\n"
+            guide += "=" * 40 + "\n"
+            guide += "File: " + filename + "\n"
+            guide += "Model size: " + str(round(size_x,1)) + " x " + str(round(size_y,1)) + " x " + str(round(size_z,1)) + " mm\n"
+            guide += "Printer: Ender 3 S1 Pro (220 x 220 x 270 mm)\n"
+            guide += "Total pieces: " + str(total_pieces) + "\n\n"
+            guide += "CUT INSTRUCTIONS:\n"
+            if cuts_x > 1:
+                guide += "- Cut along X axis into " + str(cuts_x) + " sections\n"
+            if cuts_y > 1:
+                guide += "- Cut along Y axis into " + str(cuts_y) + " sections\n"
+            if cuts_z > 1:
+                guide += "- Cut along Z axis into " + str(cuts_z) + " sections\n"
+            guide += "\nPIECES:\n"
+            for p in pieces:
+                guide += "Piece " + str(p["piece"]) + ": " + p["size"] + "\n"
+            guide += "\nASSEMBLY TIPS:\n"
+            guide += "- Open each piece in OrcaSlicer separately\n"
+            guide += "- Use same layer height for all pieces\n"
+            guide += "- Sand cut edges before gluing\n"
+            guide += "- Use epoxy or super glue\n"
+            guide += "- Clamp for 24 hours\n"
+            zf.writestr(base + "_ARIA_cut_plan.txt", guide)
+
+        zip_data = base64.b64encode(zip_buf.getvalue()).decode('utf-8')
 
         processing_jobs[job_id] = {
             "status": "complete",
             "filename": filename,
+            "zip_name": base + "_ARIA_cuts.zip",
+            "zip_data": zip_data,
             "analysis": {
                 "size_x": round(size_x,1),
                 "size_y": round(size_y,1),
                 "size_z": round(size_z,1),
                 "total_pieces": total_pieces,
                 "triangles": num_triangles,
-                "fits": total_pieces == 1
+                "fits": total_pieces == 1,
+                "cuts_x": cuts_x,
+                "cuts_y": cuts_y,
+                "cuts_z": cuts_z
             },
             "pieces": pieces
         }
@@ -430,15 +463,41 @@ function showSTLResult(d) {
   if (a.fits) {
     html += '<div class="fits-badge">FITS BED — PRINT AS ONE PIECE</div>';
   } else {
+    var cutInfo = '';
+    if (a.cuts_x > 1) cutInfo += a.cuts_x + ' cuts on X  ';
+    if (a.cuts_y > 1) cutInfo += a.cuts_y + ' cuts on Y  ';
+    if (a.cuts_z > 1) cutInfo += a.cuts_z + ' cuts on Z';
     html += '<div class="stl-info">Optimal split: <b style="color:#00ff50">' + a.total_pieces + ' pieces</b></div>';
+    if (cutInfo) html += '<div class="stl-info" style="font-size:11px;color:#4a7a4a">' + cutInfo.trim() + '</div>';
     for (var i = 0; i < d.pieces.length; i++) {
       html += '<div class="stl-piece"><span class="pnum">PIECE ' + d.pieces[i].piece + '</span><span>' + d.pieces[i].size + '</span></div>';
+    }
+    if (d.zip_data) {
+      html += '<button onclick="downloadZip()" style="margin-top:10px;width:100%;padding:10px;background:linear-gradient(135deg,#00ff50,#adff2f);border:none;border-radius:10px;color:#050810;font-family:Courier New,monospace;font-size:13px;font-weight:bold;letter-spacing:2px;cursor:pointer;">DOWNLOAD CUT PLAN</button>';
+      window._zipData = d.zip_data;
+      window._zipName = d.zip_name;
     }
   }
   html += '</div>';
   addMsg('ai', html, true);
-  var msg = a.fits ? 'Your model fits the Ender 3 S1 Pro as one piece — just open it in OrcaSlicer and print!' : 'Split into ' + a.total_pieces + ' pieces, each fits your bed. Slice each one separately in OrcaSlicer then glue together.';
+  var msg = a.fits ? 'Your model fits the Ender 3 S1 Pro as one piece — just open it in OrcaSlicer and print!' : 'Optimal ' + a.total_pieces + ' piece split ready. Download the cut plan — it has all the dimensions and assembly instructions.';
   addMsg('ai', msg, false);
+}
+
+function downloadZip() {
+  if (!window._zipData) return;
+  var bytes = atob(window._zipData);
+  var arr = new Uint8Array(bytes.length);
+  for (var i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+  var blob = new Blob([arr], {type: 'application/zip'});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = window._zipName || 'aria_cuts.zip';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 inputBox.addEventListener('keydown', function(e) {
